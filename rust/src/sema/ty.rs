@@ -10,7 +10,13 @@ use crate::{
 };
 
 pub use super::DefId;
-use super::{cx::ConstExpr, generics::GenericArgs, mir::RegionId, tyck::InferId, Definitions};
+use super::{
+    cx::ConstExpr,
+    generics::{GenericArg, GenericArgs, ParamId},
+    mir::RegionId,
+    tyck::InferId,
+    Definitions,
+};
 
 use core::num::NonZeroU16;
 
@@ -48,15 +54,38 @@ pub enum IntWidth {
 }
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum FloatWidth {
-    Bits(NonZeroU16),
-    Long,
+pub enum FloatFormat {
+    IeeeBinary,
+    IeeeExtRange,
+    IeeeExtPrecision,
+    Dfloat,
+}
+
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FloatType {
+    pub width: NonZeroU16,
+    pub format: FloatFormat,
 }
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IntType {
     pub signed: bool,
     pub width: IntWidth,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum WidePtrMetadata {
+    SliceLen,
+    VTablePtr(DefId, GenericArgs),
+}
+
+impl WidePtrMetadata {
+    pub fn to_canonical_type(&self, defs: &Definitions) -> Type {
+        match self {
+            Self::SliceLen => Type::Int(IntType::usize),
+            Self::VTablePtr(_, _) => todo!("vtable"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -70,18 +99,19 @@ pub struct FnType {
     pub iscvarargs: Spanned<bool>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum SemaLifetime {
-    Bound(Spanned<u32>),
+    Bound(ParamId),
     Region(RegionId),
     Static,
+    ErasedRegion,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Type {
     Bool,
     Int(IntType),
-    Float(FloatWidth),
+    Float(FloatType),
     Char,
     Str,
     Never,
@@ -89,17 +119,18 @@ pub enum Type {
     FnPtr(Box<FnType>),
     FnItem(Box<FnType>, DefId, GenericArgs),
     UserType(DefId, GenericArgs),
+    UnresolvedLangItem(LangItem, GenericArgs),
     IncompleteAlias(DefId),
     Pointer(Spanned<Mutability>, Box<Spanned<Type>>),
     Array(Box<Spanned<Type>>, Spanned<ConstExpr>),
-    Inferable(InferId),
+    Inferable(Option<InferId>),
     InferableInt(InferId),
     Reference(
         Option<Box<Spanned<SemaLifetime>>>,
         Spanned<Mutability>,
         Box<Spanned<Type>>,
     ),
-    Param(u32),
+    Param(ParamId),
     TraitSelf(DefId),
     DropFlags(Box<Type>),
 }
@@ -311,9 +342,35 @@ pub fn convert_tag(tag: Spanned<Symbol>, curmod: DefId, at_item: DefId) -> super
 
 // Write the Rust type here
 #[allow(non_upper_case_globals)]
-impl FloatWidth {
-    pub const f32: FloatWidth = FloatWidth::Bits(nzu16!(32));
-    pub const f64: FloatWidth = FloatWidth::Bits(nzu16!(64));
+impl FloatType {
+    pub const f16: FloatType = FloatType {
+        width: nzu16!(16),
+        format: FloatFormat::IeeeBinary,
+    };
+    pub const f32: FloatType = FloatType {
+        width: nzu16!(32),
+        format: FloatFormat::IeeeBinary,
+    };
+    pub const f64: FloatType = FloatType {
+        width: nzu16!(64),
+        format: FloatFormat::IeeeBinary,
+    };
+    pub const f128: FloatType = FloatType {
+        width: nzu16!(128),
+        format: FloatFormat::IeeeBinary,
+    };
+    pub const bf16: FloatType = FloatType {
+        width: nzu16!(16),
+        format: FloatFormat::IeeeExtRange,
+    };
+    pub const fx80: FloatType = FloatType {
+        width: nzu16!(80),
+        format: FloatFormat::IeeeExtPrecision,
+    };
+    pub const fd128: FloatType = FloatType {
+        width: nzu16!(128),
+        format: FloatFormat::Dfloat,
+    };
 }
 
 #[allow(non_upper_case_globals)] // Write the Rust type here
@@ -367,6 +424,20 @@ impl IntType {
         signed: true,
         width: IntWidth::Bits(nzu16!(128)),
     };
+}
+
+impl core::fmt::Display for FloatType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("f")?;
+
+        match self.format {
+            FloatFormat::IeeeBinary => {}
+            FloatFormat::IeeeExtRange | FloatFormat::IeeeExtPrecision => f.write_str("x")?,
+            FloatFormat::Dfloat => f.write_str("d")?,
+        }
+
+        self.width.fmt(f)
+    }
 }
 
 impl core::fmt::Display for IntType {
@@ -512,6 +583,28 @@ impl FnType {
                 .zip(&other.paramtys)
                 .all(|(a, b)| a.matches_ignore_bounds(b))
     }
+
+    pub fn substitute_generics(&self, args: &GenericArgs) -> Self {
+        let retty = Box::new(
+            self.retty
+                .copy_span(|retty| retty.substitute_generics(args)),
+        );
+        let paramtys = self
+            .paramtys
+            .iter()
+            .map(|paramty| paramty.copy_span(|paramty| paramty.substitute_generics(args)))
+            .collect();
+
+        Self {
+            safety: self.safety,
+            constness: self.constness,
+            asyncness: self.asyncness,
+            tag: self.tag,
+            iscvarargs: self.iscvarargs,
+            retty,
+            paramtys,
+        }
+    }
 }
 
 impl core::fmt::Display for FnType {
@@ -547,11 +640,34 @@ impl core::fmt::Display for FnType {
     }
 }
 
+impl SemaLifetime {
+    pub fn erase(&self) -> Self {
+        match self {
+            Self::Region(reg) => Self::ErasedRegion,
+            this => *this,
+        }
+    }
+
+    pub fn substitute_generics(&self, args: &GenericArgs) -> Self {
+        match self {
+            Self::Bound(id) => {
+                match args.get(*id) {
+                    Some(GenericArg::Lifetime(life)) => *life,
+                    Some(_) => panic!("Expected a lifetime for {id}"),
+                    None => Self::Bound(*id), // This is a locally bound lifetime from a `for<'a>` (which isn't carried into sema types)
+                }
+            }
+            this => *this,
+        }
+    }
+}
+
 impl core::fmt::Display for SemaLifetime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Bound(sym) => f.write_fmt(format_args!("'%{}", sym.body)),
+            Self::Bound(id) => f.write_fmt(format_args!("'{id}")),
             Self::Region(reg) => reg.fmt(f),
+            Self::ErasedRegion => f.write_str("'_"),
             Self::Static => f.write_str("'static"),
         }
     }
@@ -593,8 +709,13 @@ impl Type {
     pub fn rt_impl_lang(&self) -> Option<LangItem> {
         match self {
             Self::Float(x) => match *x {
-                FloatWidth::f32 => Some(LangItem::F32Rt),
-                FloatWidth::f64 => Some(LangItem::F64Rt),
+                FloatType::f32 => Some(LangItem::F32Rt),
+                FloatType::f64 => Some(LangItem::F64Rt),
+                FloatType::f16 => Some(LangItem::F16Rt),
+                FloatType::f128 => Some(LangItem::F128Rt),
+                FloatType::bf16 => Some(LangItem::Bf16Rt),
+                FloatType::fd128 => Some(LangItem::Fd128Rt),
+                FloatType::fx80 => Some(LangItem::Fx80Rt),
                 _ => None,
             },
             _ => None,
@@ -625,8 +746,13 @@ impl Type {
                 _ => None,
             },
             Self::Float(x) => match *x {
-                FloatWidth::f32 => Some(LangItem::F32),
-                FloatWidth::f64 => Some(LangItem::F64),
+                FloatType::f32 => Some(LangItem::F32),
+                FloatType::f64 => Some(LangItem::F64),
+                FloatType::f16 => Some(LangItem::F16),
+                FloatType::f128 => Some(LangItem::F128),
+                FloatType::bf16 => Some(LangItem::Bf16),
+                FloatType::fd128 => Some(LangItem::Fd128),
+                FloatType::fx80 => Some(LangItem::Fx80),
                 _ => None,
             },
             Self::Pointer(
@@ -647,6 +773,47 @@ impl Type {
             _ => None,
         }
     }
+
+    pub fn substitute_generics(&self, args: &GenericArgs) -> Self {
+        match self {
+            val @ (Type::Bool |
+            Type::Int(_) |
+            Type::Float(_) |
+            Type::Char |
+            Type::Str |
+            Type::Never) => val.clone(),
+            Type::Tuple(tys) => {
+                Type::Tuple(tys.iter().map(|ty| ty.copy_span(|ty| ty.substitute_generics(args))).collect())
+            },
+            Type::FnPtr(fnty) => {
+                Type::FnPtr(Box::new(fnty.substitute_generics(args)))
+            },
+            Type::FnItem(fnty, defid, generics) => {
+                Type::FnItem(Box::new(fnty.substitute_generics(args)), *defid, generics.substitute_generics(args))
+            },
+            Type::UserType(defid, generics) => Type::UserType(*defid, generics.substitute_generics(args)),
+            Type::Param(paramid) => {
+                match args.get(*paramid){
+                    Some(GenericArg::Type(ty)) => ty.clone(),
+                    _ => panic!("Expected a type for {paramid}"),
+                }
+            },
+            Type::TraitSelf(_) => {
+                match &args.trait_self{
+                    Some(ty) => (**ty).clone(),
+                    None => panic!("{self} can only be used in a trait body")
+                }
+            },
+            Type::Pointer(mt, ty) => Type::Pointer(*mt, Box::new(ty.copy_span(|ty| ty.substitute_generics(args)))),
+            Type::Array(ty, cx) => Type::Array(Box::new(ty.copy_span(|ty| ty.substitute_generics(args))), cx.copy_span(|cx| cx.substitute_generics(args))),
+            Type::Reference(life, mt, ty) => Type::Reference(life.as_ref().map(|life| Box::new(life.copy_span(|life| life.substitute_generics(args)))), *mt, Box::new(ty.copy_span(|ty| ty.substitute_generics(args)))),
+            Type::DropFlags(ty) => Type::DropFlags(Box::new(ty.substitute_generics(args))),
+            Type::UnresolvedLangItem(_, _) |
+            Type::IncompleteAlias(_) |
+            Type::Inferable(_) |
+            Type::InferableInt(_)  => panic!("Cannot substitute for {self} (bad type alias or unresolved lang item/inference variable)"),
+        }
+    }
 }
 
 impl core::fmt::Display for Type {
@@ -654,12 +821,15 @@ impl core::fmt::Display for Type {
         match self {
             Self::Bool => f.write_str("bool"),
             Self::Int(intty) => intty.fmt(f),
-            Self::Float(width) => {
-                f.write_str("f")?;
-                match width {
-                    FloatWidth::Bits(bits) => f.write_fmt(format_args!("{}", bits)),
-                    FloatWidth::Long => f.write_str("long"),
+            Self::Float(ty) => {
+                match ty.format {
+                    FloatFormat::IeeeBinary => f.write_str("f")?,
+                    FloatFormat::IeeeExtPrecision => f.write_str("fx")?,
+                    FloatFormat::IeeeExtRange => f.write_str("bf")?,
+                    FloatFormat::Dfloat => f.write_str("fd")?,
                 }
+
+                ty.width.fmt(f)
             }
             Self::Char => f.write_str("char"),
             Self::Str => f.write_str("str"),
@@ -714,15 +884,19 @@ impl core::fmt::Display for Type {
                 }
                 ty.body.fmt(f)
             }
-            Self::Param(var) => f.write_fmt(format_args!("%{}", var)),
+            Self::Param(var) => f.write_fmt(format_args!("{}", var)),
             Self::TraitSelf(tr) => f.write_fmt(format_args!("Self(impl #{})", tr)),
             Self::DropFlags(ty) => f.write_fmt(format_args!("DropFlags({})", ty)),
+            Self::UnresolvedLangItem(lang, args) => {
+                f.write_fmt(format_args!("{} {}", lang.name(), args))
+            }
         }
     }
 }
 
 pub fn convert_builtin_type(name: &str) -> Option<Type> {
     match name {
+        "_" => Some(Type::Inferable(None)),
         "char" => Some(Type::Char),
         "str" => Some(Type::Str),
         x if x.starts_with('i') || x.starts_with('u') => {
@@ -747,11 +921,14 @@ pub fn convert_builtin_type(name: &str) -> Option<Type> {
         x if x.starts_with('f') => {
             let size = x[1..].parse::<NonZeroU16>().ok()?;
             match size.get() {
-                32 | 64 => {}
+                16 | 32 | 64 | 32 => {}
                 _ => None?,
             }
 
-            Some(Type::Float(FloatWidth::Bits(size)))
+            Some(Type::Float(FloatType {
+                format: FloatFormat::IeeeBinary,
+                width: size,
+            }))
         }
         _ => None,
     }
@@ -767,19 +944,26 @@ pub fn convert_type(
     match ty {
         ast::Type::Path(path) => match defs.find_type(curmod, &path.body, at_item, self_ty) {
             Ok((defid, generics)) => Ok(Type::UserType(defid, generics)),
-            Err(e) => match &*path.segments {
-                [Spanned {
-                    body:
-                        PathSegment {
-                            ident:
-                                Spanned {
-                                    body: ast::SimplePathSegment::Identifier(id),
-                                    ..
-                                },
-                            generics: None,
-                        },
-                    ..
-                }] => convert_builtin_type(id).ok_or(e),
+            Err(e) => match (&*path.segments, &path.root) {
+                (
+                    [Spanned {
+                        body:
+                            PathSegment {
+                                ident:
+                                    Spanned {
+                                        body: ast::SimplePathSegment::Identifier(id),
+                                        ..
+                                    },
+                                generics: None,
+                            },
+                        ..
+                    }],
+                    None
+                    | Some(Spanned {
+                        body: ast::PathRoot::Root,
+                        ..
+                    }),
+                ) => convert_builtin_type(id).ok_or(e),
                 _ => Err(e),
             },
         },
@@ -790,7 +974,7 @@ pub fn convert_type(
             Ok(Type::Pointer(*mt, Box::new(ty)))
         }
         ast::Type::Array(_, _) => todo!("array"),
-        ast::Type::FnType(_) => todo!(),
+        ast::Type::FnType(_) => todo!("fn-ptr"),
         ast::Type::Never => Ok(Type::Never),
         ast::Type::Tuple(tys) => {
             let mut tys = tys
@@ -841,11 +1025,62 @@ pub enum Niches {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct NicheOptEnum {
+    /// The DefId of the construct for which niche optimization applies
+    pub niche_ctor: DefId,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum DiscrimPlacement {
+    /// Offset into the type - in lcrust v0, this is always `0`
+    Offset(u64),
+    /// The Discrimant is elided into niche-opt
+    FillNiche(NicheOptEnum),
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct EnumDiscriminant {
+    pub discrim_type: IntType,
+    pub discrim_placement: DiscrimPlacement,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct EnumLayout {
+    pub discrim: EnumDiscriminant,
+    pub variant_layouts: HashMap<DefId, VariantLayout>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct VariantLayout {
+    /// The value of the discriminant for this variant
+    pub discrim_val: u128,
+    /// The layout of the variant, including the discriminant (if not elided)
+    pub variant_layout: TypeLayout,
+    /// If the variant is a niche-ellision variant, indicate how the niche is filled
+    pub variant_niche_fill: Option<NicheFill>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct NicheFill {
+    pub niche_offset: u64,
+    pub niche_size: u64,
+    /// The value to put in the niche.
+    /// `None` means the niched field is uninhabited
+    pub niche_value: Option<NicheValue>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum NicheValue {
+    IntValue(u128),
+    NullPointer,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct TypeLayout {
     pub size: Option<u64>,
     pub align: Option<u64>,
-    pub enum_discriminant: Option<Type>,
-    pub wide_ptr_metadata: Option<Type>,
+    pub enum_layout: Option<EnumLayout>,
+    pub wide_ptr_metadata: Option<WidePtrMetadata>,
     pub field_offsets: HashMap<FieldName, u64>,
     pub mutable_fields: HashSet<FieldName>,
     pub niches: Option<Niches>,

@@ -33,6 +33,8 @@ impl PropagateUnreachable {
             }
             MirExpr::UnaryExpr(_, u) => Self::expr_contains_unreachable(u),
             MirExpr::GetSymbol(_) => false,
+            MirExpr::ConstChar(_, _) => false,
+            MirExpr::InlineConst(_) => false, // ish
         }
     }
 }

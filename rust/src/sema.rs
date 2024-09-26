@@ -1,8 +1,9 @@
 use std::cell::RefCell;
-use std::convert::TryInto;
 
 use ast::Mutability;
 use ast::Safety;
+use cx::ConstExprConstructor;
+use ty::AbiTag;
 use xlang::abi::collection::HashMap;
 use xlang::abi::collection::HashSet;
 use xlang::abi::pair::Pair;
@@ -126,7 +127,6 @@ pub mod hir;
 pub mod intrin;
 pub mod mir;
 pub mod ty;
-mod ty_defs;
 pub mod tyck;
 
 #[derive(Copy, Clone, Hash, PartialEq, Eq)]
@@ -211,6 +211,7 @@ pub struct Definition {
     pub attrs: Vec<Spanned<Attr>>,
     pub inner: Spanned<DefinitionInner>,
     pub generics: GenericParams,
+    pub canon_name: Symbol,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -570,7 +571,7 @@ impl Definitions {
         }
     }
 
-    pub fn allocate_defid(&mut self) -> DefId {
+    pub fn allocate_defid(&mut self, name: Symbol) -> DefId {
         let def = DefId(self.nextdefid.fetch_increment());
 
         self.defs.insert(
@@ -587,6 +588,7 @@ impl Definitions {
                     params: vec![],
                     by_name: HashMap::new(),
                 },
+                canon_name: name,
             },
         );
 
@@ -1386,6 +1388,7 @@ impl Definitions {
             ty::Type::Tuple(inner) => inner.iter().all(|ty| self.is_copy(ty)),
             ty::Type::UserType(_, _) => false, // for now
             ty::Type::IncompleteAlias(_) => panic!("incomplete alias held too late"),
+            ty::Type::UnresolvedLangItem(_, _) => panic!("Unresolved lang item"),
             ty::Type::Array(ty, _) => self.is_copy(ty),
             ty::Type::InferableInt(_) | ty::Type::Inferable(_) => {
                 panic!("Cannot determine copyability of an uninfered type")
@@ -1398,6 +1401,18 @@ impl Definitions {
 
     pub fn get_lang_item(&self, lang: LangItem) -> Option<DefId> {
         self.lang_items.get(&lang).copied()
+    }
+
+    pub fn require_lang_item(&self, lang: LangItem) -> Result<DefId> {
+        self.get_lang_item(lang).ok_or_else(|| Error {
+            span: Span::synthetic(),
+            text: format!("Lang item {} required but not defined", lang.name()),
+            category: ErrorCategory::CannotFindName,
+            containing_item: self.curcrate,
+            at_item: self.curcrate,
+            relevant_item: DefId::ROOT,
+            hints: vec![],
+        })
     }
 
     pub fn type_defid(&self, ty: &ty::Type) -> DefId {
@@ -1493,7 +1508,7 @@ impl Definitions {
                 Type::Bool => ty::TypeLayout {
                     size: Some(1),
                     align: Some(1),
-                    enum_discriminant: None,
+                    enum_layout: None,
                     wide_ptr_metadata: None,
                     field_offsets: HashMap::new(),
                     mutable_fields: HashSet::new(),
@@ -1521,37 +1536,28 @@ impl Definitions {
                         size: Some(size),
                         align: Some(align),
                         wide_ptr_metadata: None,
-                        enum_discriminant: None,
+                        enum_layout: None,
                         field_offsets: HashMap::new(),
                         mutable_fields: HashSet::new(),
                         niches: None,
                     }
                 }
-                Type::Float(width) => {
-                    let (size, align) = match width {
-                        ty::FloatWidth::Bits(bits) => {
-                            let max_align = self.properties.primitives.max_align;
-                            let width = bits.get();
-                            let size = width >> 8;
+                Type::Float(fty) => {
+                    let (size, align) = {
+                        let max_align = self.properties.primitives.max_align;
+                        let width = fty.width.get();
+                        let size = width >> 8;
 
-                            let align = size.min(max_align);
+                        let align = size.next_power_of_two().min(max_align);
 
-                            (size as u64, align as u64)
-                        }
-                        ty::FloatWidth::Long => {
-                            let align = self.properties.primitives.ldbl_align;
-                            let size = self.properties.primitives.ldbl_format.size();
-
-                            let real_size = (size + (align - 1)) & !(align - 1);
-                            (real_size as u64, align as u64)
-                        }
+                        (size as u64, align as u64)
                     };
 
                     ty::TypeLayout {
                         size: Some(size),
                         align: Some(align),
                         wide_ptr_metadata: None,
-                        enum_discriminant: None,
+                        enum_layout: None,
                         field_offsets: HashMap::new(),
                         mutable_fields: HashSet::new(),
                         niches: None,
@@ -1560,7 +1566,7 @@ impl Definitions {
                 Type::Char => ty::TypeLayout {
                     size: Some(4),
                     align: Some(self.properties.primitives.max_align.min(4) as u64),
-                    enum_discriminant: None,
+                    enum_layout: None,
                     wide_ptr_metadata: None,
                     field_offsets: HashMap::new(),
                     mutable_fields: HashSet::new(),
@@ -1572,8 +1578,8 @@ impl Definitions {
                 Type::Str => ty::TypeLayout {
                     size: None,
                     align: Some(1),
-                    wide_ptr_metadata: Some(ty::Type::Int(ty::IntType::usize)),
-                    enum_discriminant: None,
+                    wide_ptr_metadata: Some(ty::WidePtrMetadata::SliceLen),
+                    enum_layout: None,
                     field_offsets: HashMap::new(),
                     mutable_fields: HashSet::new(),
                     niches: None,
@@ -1581,7 +1587,7 @@ impl Definitions {
                 Type::Never => ty::TypeLayout {
                     size: Some(0),
                     align: Some(1),
-                    enum_discriminant: None,
+                    enum_layout: None,
                     wide_ptr_metadata: None,
                     field_offsets: HashMap::new(),
                     mutable_fields: HashSet::new(),
@@ -1640,7 +1646,7 @@ impl Definitions {
                     ty::TypeLayout {
                         size: Some(size),
                         align: Some(align),
-                        enum_discriminant: None,
+                        enum_layout: None,
                         wide_ptr_metadata: metadata,
                         field_offsets,
                         mutable_fields: HashSet::new(),
@@ -1658,7 +1664,7 @@ impl Definitions {
                     ty::TypeLayout {
                         size: Some(size as u64),
                         align: Some(align as u64),
-                        enum_discriminant: None,
+                        enum_layout: None,
                         wide_ptr_metadata: None,
                         field_offsets: HashMap::new(),
                         mutable_fields: HashSet::new(),
@@ -1668,7 +1674,7 @@ impl Definitions {
                 Type::FnItem(_, _, _) => ty::TypeLayout {
                     size: Some(0),
                     align: Some(1),
-                    enum_discriminant: None,
+                    enum_layout: None,
                     wide_ptr_metadata: None,
                     field_offsets: HashMap::new(),
                     mutable_fields: HashSet::new(),
@@ -1787,7 +1793,7 @@ impl Definitions {
                             ty::TypeLayout {
                                 size,
                                 align,
-                                enum_discriminant: None,
+                                enum_layout: None,
                                 wide_ptr_metadata,
                                 field_offsets,
                                 mutable_fields: HashSet::new(),
@@ -1798,11 +1804,13 @@ impl Definitions {
                     }
                 }
                 Type::IncompleteAlias(_) => todo!("incomplete alias held too late"),
+                Type::UnresolvedLangItem(_, _) => panic!("Unresolved lang item not resolved"),
                 Type::Pointer(_, pte) => {
                     let layout = self.layout_of(pte, at_item, containing_item);
 
                     if let Some(metadata) = &layout.wide_ptr_metadata {
-                        let meta_layout = self.layout_of(metadata, at_item, containing_item);
+                        let meta_ty = metadata.to_canonical_type(self);
+                        let meta_layout = self.layout_of(&meta_ty, at_item, containing_item);
 
                         let data_ptr_size = (self.properties.primitives.ptrbits >> 3) as u64;
                         let data_ptr_align =
@@ -1843,7 +1851,7 @@ impl Definitions {
                         ty::TypeLayout {
                             size: Some(size),
                             align: Some(align),
-                            enum_discriminant: None,
+                            enum_layout: None,
                             wide_ptr_metadata: None,
                             field_offsets: fields,
                             mutable_fields: HashSet::new(),
@@ -1856,7 +1864,7 @@ impl Definitions {
                         ty::TypeLayout {
                             size: Some(size),
                             align: Some(align),
-                            enum_discriminant: None,
+                            enum_layout: None,
                             wide_ptr_metadata: None,
                             field_offsets: HashMap::new(),
                             mutable_fields: HashSet::new(),
@@ -1879,7 +1887,7 @@ impl Definitions {
                     ty::TypeLayout {
                         size: Some(array_size),
                         align: Some(align),
-                        enum_discriminant: None,
+                        enum_layout: None,
                         wide_ptr_metadata: None,
                         field_offsets: HashMap::new(),
                         mutable_fields: HashSet::new(),
@@ -1893,7 +1901,8 @@ impl Definitions {
                     let layout = self.layout_of(ty, at_item, containing_item);
 
                     if let Some(metadata) = &layout.wide_ptr_metadata {
-                        let meta_layout = self.layout_of(metadata, at_item, containing_item);
+                        let meta_ty = metadata.to_canonical_type(self);
+                        let meta_layout = self.layout_of(&meta_ty, at_item, containing_item);
 
                         let data_ptr_size = (self.properties.primitives.ptrbits >> 3) as u64;
                         let data_ptr_align =
@@ -1941,7 +1950,7 @@ impl Definitions {
                         ty::TypeLayout {
                             size: Some(size),
                             align: Some(align),
-                            enum_discriminant: None,
+                            enum_layout: None,
                             wide_ptr_metadata: None,
                             field_offsets: fields,
                             mutable_fields: HashSet::new(),
@@ -1954,7 +1963,7 @@ impl Definitions {
                         ty::TypeLayout {
                             size: Some(size),
                             align: Some(align),
-                            enum_discriminant: None,
+                            enum_layout: None,
                             wide_ptr_metadata: None,
                             field_offsets: HashMap::new(),
                             mutable_fields: HashSet::new(),
@@ -2023,7 +2032,8 @@ impl Definitions {
                 | Type::Reference(_, _, _)
                 | Type::Pointer(_, _)
                 | Type::Array(_, _)
-                | Type::TraitSelf(_) => Vec::new(),
+                | Type::TraitSelf(_)
+                | Type::UnresolvedLangItem(_, _) => Vec::new(),
                 Type::Tuple(elems) => {
                     let mut fields = Vec::new();
 
@@ -2091,18 +2101,183 @@ impl Definitions {
             unsafe { &*fields }
         }
     }
+
+    pub fn diag_path(&self, def: DefId) -> Vec<Symbol> {
+        if def == DefId::ROOT {
+            Vec::new()
+        } else {
+            let definition = self.definition(def);
+            let mut diag_path = self.diag_path(definition.parent);
+            diag_path.push(definition.canon_name);
+            diag_path
+        }
+    }
+
+    pub fn type_name(&self, ty: &Type) -> Symbol {
+        use core::fmt::Write;
+        match ty {
+            Type::Bool => Symbol::intern("bool"),
+            Type::Int(ity) => Symbol::intern_by_val(ity.to_string()),
+            Type::Float(fty) => Symbol::intern_by_val(fty.to_string()),
+            Type::Char => Symbol::intern("char"),
+            Type::Str => Symbol::intern("str"),
+            Type::Never => Symbol::intern("!"),
+            Type::Tuple(tys) => {
+                let mut st = String::new();
+                st.push_str("(");
+                let mut sep = "";
+                for ty in tys {
+                    st.push_str(sep);
+                    st.push_str(&self.type_name(ty));
+                    sep = ", ";
+                }
+                st.push_str(")");
+                Symbol::intern_by_val(st)
+            }
+            Type::FnPtr(ptr) => {
+                let mut st = String::new();
+                if ptr.safety.body == Safety::Unsafe {
+                    st.push_str("unsafe ");
+                }
+                match &ptr.tag.body {
+                    AbiTag::Rust => {}
+                    tag => {
+                        write!(st, "extern \"{tag}\" ").unwrap();
+                    }
+                }
+                st.push_str("fn(");
+                let mut sep = "";
+                for ty in &ptr.paramtys {
+                    st.push_str(sep);
+                    st.push_str(&self.type_name(ty));
+                    sep = ", ";
+                }
+                if ptr.iscvarargs.body {
+                    st.push_str(sep);
+                    st.push_str("...");
+                }
+                st.push_str(") -> ");
+                st.push_str(&self.type_name(&ptr.retty));
+                Symbol::intern_by_val(st)
+            }
+            Type::FnItem(fnty, def, _) => {
+                let mut st = String::new();
+                if fnty.asyncness.body == ty::AsyncType::Async {
+                    st.push_str("async ");
+                }
+                if fnty.safety.body == Safety::Unsafe {
+                    st.push_str("unsafe ");
+                }
+                match &fnty.tag.body {
+                    AbiTag::Rust => {}
+                    tag => {
+                        write!(st, "extern \"{tag}\" ").unwrap();
+                    }
+                }
+                st.push_str("fn(");
+                let mut sep = "";
+                for ty in &fnty.paramtys {
+                    st.push_str(sep);
+                    st.push_str(&self.type_name(ty));
+                    sep = ", ";
+                }
+                if fnty.iscvarargs.body {
+                    st.push_str(sep);
+                    st.push_str("...");
+                }
+                st.push_str(") -> ");
+                st.push_str(&self.type_name(&fnty.retty));
+
+                st.push_str(" {");
+
+                sep = "";
+
+                for seg in self.diag_path(*def) {
+                    st.push_str(sep);
+                    st.push_str(&seg);
+                    sep = "::"
+                }
+                st.push_str("}");
+
+                Symbol::intern_by_val(st)
+            }
+            Type::UserType(def, _) => {
+                let mut st = String::new();
+                let mut sep = "";
+
+                for seg in self.diag_path(*def) {
+                    st.push_str(sep);
+                    st.push_str(&seg);
+                    sep = "::"
+                }
+                Symbol::intern_by_val(st)
+            }
+
+            Type::Pointer(_, _) => todo!("pointer"),
+            Type::Array(_, _) => todo!("array"),
+            Type::Reference(_, _, _) => todo!("reference"),
+            Type::UnresolvedLangItem(_, _)
+            | Type::IncompleteAlias(_)
+            | Type::Inferable(_)
+            | Type::InferableInt(_)
+            | Type::Param(_)
+            | Type::TraitSelf(_)
+            | Type::DropFlags(_) => panic!("Invalid Internal type for `type_name`"),
+        }
+    }
 }
 
 impl Definitions {
+    pub fn evaluate_const_expr(
+        &self,
+        cx: &Spanned<cx::ConstExpr>,
+        at_item: DefId,
+        containing_item: DefId,
+    ) -> Result<cx::ConstExpr> {
+        match &cx.body {
+            cx::ConstExpr::MirVal(_) => todo!("evaluate mir"),
+            cx::ConstExpr::HirVal(_) => panic!("Hir must be expanded before evaluation"),
+            cx::ConstExpr::Param(_) => panic!("Substitute Generics before evaluation"),
+            cx::ConstExpr::IntConst(ity, val) => Ok(cx::ConstExpr::IntConst(*ity, *val)),
+            cx::ConstExpr::Const(defid, generics) => {
+                Ok(cx::ConstExpr::Const(*defid, generics.clone()))
+            }
+            cx::ConstExpr::Constructor(ctor) => {
+                let ctor_id = ctor.ctor_id;
+                let generics = ctor.generics.clone();
+                let fields = ctor
+                    .fields
+                    .iter()
+                    .map(|Pair(field, val)| {
+                        Ok((
+                            field.clone(),
+                            val.try_copy_span(|_| {
+                                self.evaluate_const_expr(val, at_item, containing_item)
+                            })?,
+                        ))
+                    })
+                    .collect::<Result<_>>()?;
+
+                Ok(cx::ConstExpr::Constructor(ConstExprConstructor {
+                    ctor_id,
+                    generics,
+                    fields,
+                }))
+            }
+        }
+    }
+
     pub fn evaluate_as_u64(
         &self,
         cx: &Spanned<cx::ConstExpr>,
         at_item: DefId,
         containing_item: DefId,
     ) -> Result<u64> {
-        match &cx.body {
-            cx::ConstExpr::HirVal(_) => todo!("expand hir"),
-            cx::ConstExpr::IntConst(_, val) => (*val).try_into().map_err(|_| Error {
+        match self.evaluate_const_expr(cx, at_item, containing_item)? {
+            cx::ConstExpr::HirVal(_) | cx::ConstExpr::MirVal(_) | cx::ConstExpr::Param(_) => {
+                unreachable!("Unexpanded Complex Expressions")
+            }
+            cx::ConstExpr::IntConst(_, val) => val.try_into().map_err(|_| Error {
                 span: cx.span,
                 text: format!("value {} is not in range", val),
                 category: ErrorCategory::ConstEvalError(cx::ConstEvalError::EvaluatorError),
@@ -2111,8 +2286,40 @@ impl Definitions {
                 relevant_item: at_item,
                 hints: vec![],
             }),
-            cx::ConstExpr::Const(_) => todo!("const items"),
+            cx::ConstExpr::Const(defid, _) => panic!("{defid} is not a u64"),
+            cx::ConstExpr::Constructor(ctor) => panic!("{ctor} is not a u64"),
         }
+    }
+
+    pub fn evaluate_as_constructor(
+        &self,
+        cx: &Spanned<cx::ConstExpr>,
+        at_item: DefId,
+        containing_item: DefId,
+    ) -> Result<DefId> {
+        match self.evaluate_const_expr(cx, at_item, containing_item)? {
+            cx::ConstExpr::HirVal(_) | cx::ConstExpr::MirVal(_) | cx::ConstExpr::Param(_) => {
+                unreachable!("Unexpanded Complex Expressions")
+            }
+            cx::ConstExpr::IntConst(intty, val) => {
+                panic!("{val}_{intty} is not a struct, union, or enum type")
+            }
+            cx::ConstExpr::Const(defid, _) => {
+                panic!("{defid} is not a struct, union, or enum type")
+            }
+            cx::ConstExpr::Constructor(ctor) => Ok(ctor.ctor_id),
+        }
+    }
+
+    pub fn evaluate_as_discriminant(
+        &self,
+        cx: &Spanned<cx::ConstExpr>,
+        at_item: DefId,
+        containing_item: DefId,
+    ) -> Result<u128> {
+        let ctor = self.evaluate_as_constructor(cx, at_item, containing_item)?;
+
+        todo!("evaluate_as_discriminant")
     }
 }
 
@@ -2664,7 +2871,7 @@ fn scan_modules(defs: &mut Definitions, curmod: DefId, md: &Spanned<ast::Mod>) -
 
         match &item.item.body {
             ast::ItemBody::Mod(md) => {
-                let defid = defs.allocate_defid();
+                let defid = defs.allocate_defid(md.name.body);
 
                 let def = defs.definition_mut(defid);
                 def.parent = curmod;
@@ -2736,7 +2943,7 @@ fn collect_types(defs: &mut Definitions, curmod: DefId, md: &Spanned<ast::Mod>) 
                 defs.definition_mut(mddef).visible_from = visible_from;
             }
             ast::ItemBody::UserType(uty) => {
-                let defid = defs.allocate_defid();
+                let defid = defs.allocate_defid(uty.name.body);
                 let utys = match &uty.body.body {
                     ast::UserTypeBody::Struct(
                         Spanned {
@@ -2778,7 +2985,7 @@ fn collect_types(defs: &mut Definitions, curmod: DefId, md: &Spanned<ast::Mod>) 
                 unreachable!("macros are expanded before semantic analysis")
             }
             ast::ItemBody::Trait(tr) => {
-                let defid = defs.allocate_defid();
+                let defid = defs.allocate_defid(tr.name.body);
                 let trbody = TraitDef {
                     auto: tr.auto.is_some(),
                     safety: tr.safety.map(|s| s.body).unwrap_or(Safety::Safe),
@@ -2833,9 +3040,10 @@ fn collect_function(
     let actual_tag = itemfn
         .abi
         .map(|tag| {
-            Ok(Spanned {
-                body: ty::convert_tag(tag, curmod, item)?,
-                span: tag.span,
+            tag.try_map_span(|tag| {
+                tag.tag.map_or(Ok(ty::AbiTag::C { unwind: false }), |tag| {
+                    ty::convert_tag(tag, curmod, item)
+                })
             })
         })
         .transpose()?;
@@ -2880,12 +3088,12 @@ fn collect_function(
 
     let constness = itemfn.constness.unwrap_or(Spanned {
         body: Mutability::Mut,
-        span: Span::empty(),
+        span: Span::synthetic(),
     });
     let asyncness = itemfn.is_async.map_or(
         Spanned {
             body: ty::AsyncType::Normal,
-            span: Span::empty(),
+            span: Span::synthetic(),
         },
         |isasync| Spanned {
             body: ty::AsyncType::Async,
@@ -3095,7 +3303,7 @@ fn collect_values(defs: &mut Definitions, curmod: DefId, md: &Spanned<ast::Mod>)
             ast::ItemBody::Use(_) => todo!("use"),
             ast::ItemBody::Value(_) => todo!("value"),
             ast::ItemBody::Function(itemfn) => {
-                let defid = defs.allocate_defid();
+                let defid = defs.allocate_defid(itemfn.name.body);
                 let (inner, generics) =
                     collect_function(defs, curmod, defid, itemfn, None, None, None, None, None)?;
 
@@ -3116,7 +3324,7 @@ fn collect_values(defs: &mut Definitions, curmod: DefId, md: &Spanned<ast::Mod>)
                 defs.collect_lang_items(defid, &[LangItemTarget::Function])?;
             }
             ast::ItemBody::ExternBlock(blk) => {
-                let extern_defid = defs.allocate_defid();
+                let extern_defid = defs.allocate_defid(Symbol::intern("<extern block>"));
 
                 let def = defs.definition_mut(extern_defid);
 
@@ -3144,9 +3352,10 @@ fn collect_values(defs: &mut Definitions, curmod: DefId, md: &Spanned<ast::Mod>)
                 for item in &blk.items {
                     let visible_from =
                         convert_visibility(defs, curmod, item.vis.as_ref())?.unwrap_or(curmod);
-                    let defid = defs.allocate_defid();
+
                     match &item.item.body{
                         ast::ItemBody::Function(itemfn) => {
+                            let defid = defs.allocate_defid(itemfn.name.body);
                             let (inner, generics) = collect_function(defs, curmod, defid, itemfn, Some(tag), Some(Spanned{body: Safety::Unsafe, span: Span::empty()}), Some(blk.span),Some(extern_defid),None)?;
 
                             let def = defs.definition_mut(defid);
@@ -3170,7 +3379,7 @@ fn collect_values(defs: &mut Definitions, curmod: DefId, md: &Spanned<ast::Mod>)
                                 span: item.span,
                                 text: format!("Cannot define items other than functions or statics in an extern block"),
                                 category: ErrorCategory::Other,
-                                at_item: defid,
+                                at_item: extern_defid,
                                 containing_item: curmod,
                                 relevant_item: extern_defid,
                                 hints: vec![SemaHint{ text: format!("Declared inside this extern block"), itemref: extern_defid, refspan: blk.span }]
@@ -3189,9 +3398,9 @@ fn collect_values(defs: &mut Definitions, curmod: DefId, md: &Spanned<ast::Mod>)
                         ast::ItemBody::Value(_) => {
                             todo!("Associated Const in Trait")
                         }
-                        ast::ItemBody::Function(_f) => {
+                        ast::ItemBody::Function(f) => {
                             let ty = Type::TraitSelf(defid);
-                            let fndef = defs.allocate_defid();
+                            let fndef = defs.allocate_defid(f.name.body);
                             todo!("trait body {} {}", ty, fndef);
                         }
                         item => unreachable!(
@@ -3202,7 +3411,7 @@ fn collect_values(defs: &mut Definitions, curmod: DefId, md: &Spanned<ast::Mod>)
                 }
             }
             ast::ItemBody::ImplBlock(blk) => {
-                let defid = defs.allocate_defid();
+                let defid = defs.allocate_defid(Symbol::intern("<impl block>"));
                 if let Some(vis) = item.vis.as_ref() {
                     return Err(Error {
                         span: vis.span,
@@ -3819,8 +4028,9 @@ pub fn convert_crate(
     defs: &mut Definitions,
     md: &Spanned<ast::Mod>,
     cr_type: CrateType,
+    crate_name: Symbol,
 ) -> Result<()> {
-    let root = defs.allocate_defid();
+    let root = defs.allocate_defid(crate_name);
     defs.set_current_crate(root);
 
     scan_modules(defs, root, md)?;
@@ -3844,7 +4054,7 @@ pub fn convert_crate(
         .any(|x| **x == Attr::NoMain);
 
     if cr_type == CrateType::Bin && !is_no_main {
-        let lccc_main = defs.allocate_defid();
+        let lccc_main = defs.allocate_defid(Symbol::intern("__lccc_main"));
         let (main, main_span) = find_main(defs, root)?;
 
         let ity = ty::IntType::i32;
@@ -3867,7 +4077,7 @@ pub fn convert_crate(
         } else {
             mir::mir! {
                 @0: { []
-                    call _0 = #<main>: <fnty>() next @1 []
+                    call _0 = #<main>: <fnty>() next fallthrough @1 []
                 }
                 @1: { [_0: <retty>]
                     store dead _0;

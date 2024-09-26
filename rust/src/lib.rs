@@ -16,6 +16,7 @@ mod serialize;
 mod session;
 mod span;
 
+use interning::Symbol;
 use lex::lex;
 
 use peekmore::PeekMore;
@@ -91,7 +92,13 @@ impl XLangFrontend for RustFrontend {
         let parsed = do_mod(&mut lexed.into_iter().peekmore()).unwrap();
         println!("{:?}", parsed);
         let mut defs = Definitions::new(props);
-        convert_crate(&mut defs, &parsed, CrateType::Bin).unwrap();
+        convert_crate(
+            &mut defs,
+            &parsed,
+            CrateType::Bin,
+            Symbol::intern(crate_name),
+        )
+        .unwrap();
 
         eprintln!("{}", defs);
         defs.set_current_crate_name(crate_name);
@@ -116,6 +123,7 @@ impl XLangPlugin for RustFrontend {
 xlang::host::rustcall! {
     #[allow(clippy::missing_const_for_fn)]
     #[no_mangle]
+    #[allow(improper_ctypes_definitions)]
     pub extern "rustcall" fn xlang_frontend_main() -> DynBox<dyn XLangFrontend> {
         DynBox::unsize_box(Box::new(RustFrontend::new()))
     }
