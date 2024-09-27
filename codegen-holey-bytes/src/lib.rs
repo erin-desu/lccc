@@ -1,164 +1,376 @@
-use arch_ops::holeybytes::{Instruction, Register};
-use target_tuples::Architecture;
+mod callconv;
+
+use arch_ops::{
+    holeybytes::{Instruction, Register},
+    x86::codegen::Reg,
+};
+use callconv::CallConv;
+use target_tuples::{Architecture, Target};
 use xlang::{
-    abi::{span::Span, string::StringView, traits::DynMut}, plugin::{OutputMode, XLangCodegen}, targets::properties::TargetProperties
+    abi::string::StringView,
+    plugin::v1::XLangCodegen,
+    prelude::v1::{Box as XBox, DynBox, HashMap},
+    targets::properties::TargetProperties,
 };
 use xlang_backend::{
-    callconv::CallingConvention, expr::{Trap, ValLocation}, mc::MCInsn, ty::TypeInformation, FunctionRawCodegen
+    callconv::{compute_call_conv, CallConvLocation},
+    mach::{self, mce::MceInstruction},
+    regalloc::{Assignment, RegAllocClobbers, RegGroup},
+    ssa::{CallLocations, CallTarget, OpaqueLocation, SsaInstruction},
+    ty::TypeInformation,
+    SsaCodegenPlugin,
 };
-use xlang_struct::{AccessClass, BinaryOp, Type};
+use xlang_struct::FnType;
 
-pub enum Location {
-    Null,
+pub enum ValueLocation {
+    Nowhere,
     Register(Register),
-    SpDisp(Option<Register>, i32),
+    SpDisp(i32),
 }
 
-impl ValLocation for Location {
-    fn addressible(&self) -> bool {
-        matches!(self, Self::SpDisp(_, _))
+impl ValueLocation {
+    fn from_callconv(ccl: &CallConvLocation<Register>) -> Self {
+        match ccl {
+            CallConvLocation::Register(reg) => Self::Register(*reg),
+            CallConvLocation::Indirect(_) => todo!(),
+            CallConvLocation::StackOffset(offset) => Self::SpDisp(*offset),
+            CallConvLocation::Split(vec) => todo!(),
+            CallConvLocation::Null => Self::Nowhere,
+        }
+    }
+}
+
+pub struct LocationAssignmnt {
+    location: ValueLocation,
+    moves: Vec<(usize, ValueLocation)>,
+    owner_block: u32,
+    size: u64,
+    align: u64,
+}
+
+impl Assignment for LocationAssignmnt {
+    type Register = Register;
+
+    fn current_owned_register(&self) -> Option<Self::Register> {
+        todo!()
     }
 
-    fn unassigned(n: usize) -> Self {
+    fn move_to_register(&mut self, reg: Self::Register, at: usize) {
+        self.moves.push((at, ValueLocation::Register(reg)));
+    }
+
+    fn move_to_memory(&mut self, at: usize) {
         todo!()
     }
 }
 
-pub struct CallConv {}
-impl CallingConvention for CallConv {
-    type Loc = Location;
+pub struct Assignments {
+    map: HashMap<u32, LocationAssignmnt>,
+    return_: ValueLocation,
+}
 
-    fn pass_return_place(&self, ty: &Type) -> Option<Self::Loc> {
-        todo!()
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct RegisterGroup {
+    start: Register,
+    end: Register,
+}
+
+impl RegisterGroup {
+    const ALL_GPRGS: Self = Self {
+        start: Register(1),
+        end: Register(255),
+    };
+}
+
+impl RegGroup for RegisterGroup {
+    type Register = Register;
+
+    fn registers(&self) -> impl IntoIterator<Item = Self::Register> + '_ {
+        (self.start.0..=self.end.0).map(Register)
     }
+}
 
-    fn find_param(
+impl mach::mce::MceWriter for Machine {
+    type Instruction = Instruction;
+
+    fn write_machine_code<W: arch_ops::traits::InsnWrite, F: FnMut(u128, String)>(
         &self,
-        fnty: &xlang_struct::FnType,
-        real: &xlang_struct::FnType,
-        param: u32,
-        infn: bool,
-    ) -> Self::Loc {
-        todo!()
-    }
-
-    fn find_return_val(&self, fnty: &xlang_struct::FnType) -> Self::Loc {
-        todo!()
-    }
-}
-
-pub struct MachineFeatures {}
-impl xlang_backend::mc::MachineFeatures for MachineFeatures {
-    type Loc = Location;
-    type CallConv = CallConv;
-
-    fn native_int_size(&self) -> u16 {
-        64
-    }
-
-    fn native_float_size(&self) -> Option<u16> {
-        Some(64)
-    }
-
-    fn lockfree_use_libatomic(&self, size: u64) -> bool {
-        todo!()
-    }
-
-    fn lockfree_cmpxchg_use_libatomic(&self, size: u64) -> bool {
-        todo!()
-    }
-
-    fn has_wait_free_compound(&self, op: BinaryOp, size: u64) -> bool {
-        size <= self.native_int_size()
-    }
-
-    fn has_wait_free_compound_fetch(&self, op: BinaryOp, size: u64) -> bool {
-        todo!()
-    }
-
-    fn mangle(&self, path: &[xlang_struct::PathComponent]) -> String {
-        xlang_backend::mangle::mangle_itanium(path)
-    }
-}
-
-pub struct MCWriter {}
-impl xlang_backend::mc::MCWriter for MCWriter {
-    type Features = Features;
-    type Clobbers = ();
-
-    fn resolve_locations(
-        &self,
-        insns: &mut [xlang_backend::mc::MCInsn<
-            <Self::Features as xlang_backend::mc::MachineFeatures>::Loc,
-        >],
-        callconv: &<Self::Features as xlang_backend::mc::MachineFeatures>::CallConv,
-    ) -> Self::Clobbers {
-        todo!()
-    }
-
-    fn write_machine_code<I: arch_ops::traits::InsnWrite, F: FnMut(String, u64)>(
-        &self,
-        insns: &[MCInsn<
-            <Self::Features as xlang_backend::mc::MachineFeatures>::Loc,
-        >],
-        clobbers: Self::Clobbers,
-        tys: std::rc::Rc<TypeInformation>,
-        out: &mut I,
-        sym_accepter: F,
+        insn: &[MceInstruction<Self::Instruction>],
+        writer: &mut W,
+        sym_accepter: &mut F,
     ) -> std::io::Result<()> {
         todo!()
     }
 
-    fn get_call_conv(
+    fn write_assembly<W: core::fmt::Write>(
         &self,
-        realty: &xlang_struct::FnType,
-        targ: &'static TargetProperties<'static>,
-        features: Span<StringView>,
-        ty_info: std::rc::Rc<TypeInformation>,
-    ) -> <Self::Features as xlang_backend::mc::MachineFeatures>::CallConv {
-        todo!()
-    }
-
-    fn get_features(
-        &self,
-        properties: &'static TargetProperties<'static>,
-        features: Span<StringView>,
-    ) -> Self::Features {
-        todo!()
-    }
-
-    fn target_matches(&self, name: &str) -> bool {
+        insn: &[MceInstruction<Self::Instruction>],
+        writer: &mut W,
+    ) -> core::fmt::Result {
         todo!()
     }
 }
 
-pub struct CodegenPlugin {}
-impl XLangCodegen for CodegenPlugin {
-    fn target_matches(&self, x: StringView) -> bool {
-        matches!(
-            target
-                .x
-                .parse()
-                .expect("Expected known target tuple")
-                .arch(),
-            Architecture::HoleyBytes,
-        )
+type BlockClobbers = RegAllocClobbers<RegisterGroup>;
+pub struct Machine;
+impl mach::Machine<SsaInstruction> for Machine {
+    type Assignments = Assignments;
+    type BlockClobbers = BlockClobbers;
+
+    fn matches_target(&self, targ: StringView) -> bool {
+        Target::parse(&targ).arch() == Architecture::HoleyBytes
     }
 
-    fn write_output(
-        &mut self,
-        x: DynMut<dyn xlang::abi::io::Write>,
-        mode: OutputMode,
-    ) -> xlang::abi::io::Result<()> {
+    fn init_from_target(&mut self, _targ: &TargetProperties) {
+        // no extra target-specific stuff existing
+    }
+
+    fn new_assignments(&self) -> Self::Assignments {
+        Assignments {
+            map: HashMap::new(),
+            return_: ValueLocation::Nowhere,
+        }
+    }
+
+    fn assign_call_conv(
+        &self,
+        assignments: &mut Self::Assignments,
+        incoming: &[OpaqueLocation],
+        fnty: &FnType,
+        typeinfo: &TypeInformation,
+        which: u32,
+    ) {
+        let callconv = compute_call_conv(&callconv::CallConvInfo, fnty, fnty, typeinfo);
+        for (param, incoming) in callconv.params().iter().zip(incoming) {
+            let Some((size, align)) = type_align_size(typeinfo, &incoming.ty) else {
+                // Smells like ZST, idk if skip it or not
+                return;
+            };
+
+            let assignment = LocationAssignmnt {
+                location: ValueLocation::from_callconv(param),
+                moves: Vec::new(),
+                owner_block: which,
+                align,
+                size,
+            };
+
+            assignments.map.insert(incoming.num, assignment);
+        }
+
+        assignments.return_ = ValueLocation::from_callconv(callconv.ret_location());
+    }
+
+    fn assign_locations(
+        &self,
+        assignments: &mut Self::Assignments,
+        insns: &[SsaInstruction],
+        incoming: &[OpaqueLocation],
+        which: u32,
+        incoming_set: &xlang::prelude::v1::HashMap<
+            u32,
+            xlang::vec::Vec<xlang_backend::ssa::OpaqueLocation>,
+        >,
+        typeinfo: &TypeInformation,
+    ) -> Self::BlockClobbers {
+        let mut clobbers = RegAllocClobbers::from_groups(std::iter::once(RegisterGroup::ALL_GPRGS));
+
+        for location in incoming {
+            let id = location.num;
+            let Some(location) = assignments.map.get(&id) else {
+                continue;
+            };
+
+            match location.location {
+                ValueLocation::Nowhere | ValueLocation::SpDisp(_) => (),
+                ValueLocation::Register(register) => clobbers.mark_owning(id, register, 0),
+            }
+        }
+
+        let mut ctx = LocationAssignmentContext {
+            assignments,
+            clobbers: &mut clobbers,
+            typeinfo,
+            block: which,
+            insn_num: 0,
+        };
+
+        for (num, insn) in insns.iter().enumerate() {
+            ctx.insn_num = num;
+
+            match insn {
+                SsaInstruction::Call(call_target, call_locations) => {
+                    self.assign_locations_insn_call(&mut ctx, call_target, call_locations)
+                }
+                SsaInstruction::Jump(_, vec) => todo!(),
+                SsaInstruction::Fallthrough(_, vec) => todo!(),
+                SsaInstruction::Exit(vec) => todo!(),
+                SsaInstruction::Tailcall(call_target, vec) => todo!(),
+                SsaInstruction::Trap(trap) => todo!(),
+                SsaInstruction::LoadImmediate(opaque_location, _) => todo!(),
+                SsaInstruction::LoadSymAddr(opaque_location, address) => todo!(),
+                SsaInstruction::ZeroInit(opaque_location) => todo!(),
+                SsaInstruction::Branch(
+                    branch_condition,
+                    opaque_location,
+                    opaque_location1,
+                    _,
+                    vec,
+                ) => todo!(),
+                SsaInstruction::BranchZero(branch_condition, opaque_location, _, vec) => todo!(),
+            }
+        }
+
+        clobbers
+    }
+
+    fn codegen_prologue(
+        &self,
+        assignments: &Self::Assignments,
+    ) -> xlang::vec::Vec<MceInstruction<Self::Instruction>> {
         todo!()
     }
+
+    fn codegen_block<F: Fn(u32) -> String>(
+        &self,
+        assignments: &Self::Assignments,
+        insns: &[SsaInstruction],
+        block_clobbers: Self::BlockClobbers,
+        label_sym: F,
+        which: u32,
+        tys: &TypeInformation,
+    ) -> xlang::vec::Vec<MceInstruction<Self::Instruction>> {
+        todo!()
+    }
+}
+
+impl Machine {
+    fn assign_locations_insn_call(
+        &self,
+        ctx: &mut LocationAssignmentContext,
+        target: &CallTarget,
+        locations: &CallLocations,
+    ) {
+        let callconv = compute_call_conv(
+            &callconv::CallConvInfo,
+            &target.real_ty,
+            &target.real_ty,
+            ctx.typeinfo,
+        );
+
+        // todo: clobber non-saved registers
+
+        for (location, callconv_location) in locations.params.iter().zip(callconv.params()) {
+            let Some((size, align)) = type_align_size(ctx.typeinfo, &location.ty) else {
+                // Probably ZST?
+                continue;
+            };
+
+            match callconv_location {
+                CallConvLocation::Null => (),
+                CallConvLocation::Register(register) => self.assign_locations_insn_call_reg(
+                    ctx,
+                    &callconv,
+                    location,
+                    locations.ret.as_ref(),
+                    *register,
+                    size,
+                    align,
+                ),
+                CallConvLocation::Indirect(_) => todo!(),
+                CallConvLocation::StackOffset(_) => todo!(),
+                CallConvLocation::Split(vec) => todo!(),
+            }
+        }
+    }
+
+    fn assign_locations_insn_call_reg(
+        &self,
+        ctx: &mut LocationAssignmentContext,
+        callconv: &CallConv,
+        location: &OpaqueLocation,
+        ret_location: Option<&OpaqueLocation>,
+        register: Register,
+        size: u64,
+        align: u64,
+    ) {
+        let location_num = location.num;
+
+        if let Some(assignment) = ctx.assignments.map.get_mut(&location_num) {
+            ctx.clobbers.mark_used(location_num, assignment);
+        }
+
+        ctx.clobbers
+            .mark_clobbered(register, Some(location_num), ctx.insn_num);
+
+        let assignment = ctx
+            .assignments
+            .map
+            .get_or_insert_with_mut(location_num, |_| LocationAssignmnt {
+                location: ValueLocation::Register(register),
+                moves: vec![],
+                owner_block: ctx.block,
+                size,
+                align,
+            });
+
+        assignment.move_to_register(register, ctx.insn_num);
+        ctx.clobbers
+            .mark_owning(location_num, register, ctx.insn_num);
+
+        if let Some(ret_location) = ret_location {
+            let Some((align, size)) = type_align_size(ctx.typeinfo, &ret_location.ty) else {
+                return;
+            };
+
+            let mut insert_location = |location| {
+                ctx.assignments.map.insert(
+                    ret_location.num,
+                    LocationAssignmnt {
+                        location,
+                        moves: vec![],
+                        owner_block: ctx.block,
+                        size,
+                        align,
+                    },
+                );
+            };
+
+            match callconv.ret_location() {
+                CallConvLocation::Null => {
+                    insert_location(ValueLocation::Nowhere);
+                }
+                CallConvLocation::Register(register) => {
+                    insert_location(ValueLocation::Register(*register));
+                    ctx.clobbers
+                        .mark_owning(ret_location.num, *register, ctx.insn_num);
+                }
+                CallConvLocation::Indirect(_) => todo!(),
+                CallConvLocation::StackOffset(_) => todo!(),
+                CallConvLocation::Split(_vec) => todo!(),
+            }
+        };
+    }
+}
+
+struct LocationAssignmentContext<'a> {
+    assignments: &'a mut Assignments,
+    clobbers: &'a mut BlockClobbers,
+    typeinfo: &'a TypeInformation,
+    block: u32,
+    insn_num: usize,
+}
+
+fn type_align_size(typeinfo: &TypeInformation, type_: &xlang_struct::Type) -> Option<(u64, u64)> {
+    let size = typeinfo.type_size(type_)?;
+    let align = typeinfo.type_align(type_)?;
+    Some((size, align))
 }
 
 xlang::host::rustcall! {
     #[no_mangle]
-    pub extern "rustcall" fn xlang_backend_main() -> DynBox<dyn XLangCOdegen> {
-        DynBox::unsize_box(xlang::prelude::v1::Box::new(CodegenPlugin {}))
+    #[allow(improper_ctypes_definitions)]
+    pub extern "rustcall" fn xlang_backend_main() -> DynBox<dyn XLangCodegen> {
+        DynBox::unsize_box(XBox::new(SsaCodegenPlugin::new(Machine)))
     }
 }
-
-xlang::plugin_abi_version!("0.1");

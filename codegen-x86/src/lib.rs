@@ -522,6 +522,7 @@ impl Machine<SsaInstruction> for X86Machine {
     type BlockClobbers = X86Clobbers;
 
     fn new_assignments(&self) -> Self::Assignments {
+        
         let mode = self.mode.expect("Target must have been set");
         let gpr_size = mode.largest_gpr();
         let sp = X86Register::from_class(gpr_size, 4).unwrap();
